@@ -1,82 +1,88 @@
 import streamlit as st
 import os
-import tempfile
+from pathlib import Path
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
+from langchain_core.runnables import RunnablePassthrough
 
-st.set_page_config(page_title="RAG Chatbot 📄", page_icon="🤖")
-st.title("Chat con tu PDF (RAG) 🤖")
+# --- CONFIGURACIÓN DE LA PÁGINA ---
+st.set_page_config(page_title="SafeBank RAG Assistant", layout="centered")
+st.title("📄 Asistente Virtual con RAG")
 
-# --- Configuración en Barra Lateral ---
+# --- BARRA LATERAL: Configuración ---
 with st.sidebar:
     st.header("Configuración")
-    api_key = st.text_input("Introduce tu Groq API Key:", type="password")
-    uploaded_file = st.file_uploader("Sube un archivo PDF", type="pdf")
-    st.info("Obtén tu clave en [console.groq.com](https://console.groq.com/keys)")
+    api_key = st.text_input("Introduce tu Groq API Key", type="password")
+    model_id = st.selectbox("Modelo", ["llama-3.3-70b-versatile", "llama3-8b-8192"])
+    temperature = st.slider("Temperatura", 0.0, 1.5, 0.7, step=0.1)
+    
+    uploaded_file = st.file_uploader("Sube un manual (PDF)", type="pdf")
 
-# --- Función para procesar el PDF ---
-def process_pdf(file, _embeddings):
-    # Guardar archivo temporalmente para que PyMuPDF pueda leerlo
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(file.getvalue())
-        tmp_path = tmp_file.name
-
-    loader = PyMuPDFLoader(tmp_path)
+# --- FUNCIONES CORE ---
+def process_pdf(file):
+    # Guardar temporalmente para que PyMuPDF pueda leerlo
+    temp_path = Path("temp_manual.pdf")
+    with open(temp_path, "wb") as f:
+        f.write(file.getvalue())
+    
+    # 1. Cargar y Extraer
+    loader = PyMuPDFLoader(str(temp_path))
     docs = loader.load()
+    content = "\n".join([page.page_content for page in docs])
     
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    splits = text_splitter.split_documents(docs)
+    # 2. Splitter (Chunks)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = text_splitter.split_text(content)
     
-    vectorstore = FAISS.from_documents(documents=splits, embedding=_embeddings)
-    os.remove(tmp_path) # Limpiar archivo temporal
+    # 3. Embeddings y Vectorstore
+    embedding_model = "BAAI/bge-large-en-v1.5"
+    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
+    vectorstore = FAISS.from_texts(chunks, embedding=embeddings)
+    
     return vectorstore
 
-# --- Lógica Principal ---
+# --- FLUJO PRINCIPAL ---
 if api_key and uploaded_file:
-    try:
-        # 1. Cargar Embeddings (se cachean para no recargar)
-        @st.cache_resource
-        def load_embeddings():
-            return HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-        
-        embeddings = load_embeddings()
+    os.environ["GROQ_API_KEY"] = api_key
+    
+    # Procesar el archivo una sola vez
+    if "vectorstore" not in st.session_state:
+        with st.spinner("Indexando documento..."):
+            st.session_state.vectorstore = process_pdf(uploaded_file)
+            st.success("¡Documento indexado con éxito!")
 
-        # 2. Procesar el PDF y crear el Vector Store
-        vectorstore = process_pdf(uploaded_file, embeddings)
-        retriever = vectorstore.as_retriever()
+    # Configuración de la cadena RAG
+    llm = ChatGroq(model=model_id, temperature=temperature)
+    retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 6})
+    
+    system_prompt = """You are a helpful virtual assistant answering questions about a company's services.
+    Use the following bits of retrieved context to answer the question.
+    If you don't know the answer, just say you don't know. Keep your answer concise. \n\n"""
 
-        # 3. Configurar el LLM y la cadena de RAG
-        llm = ChatGroq(groq_api_key=api_key, model="llama-3.3-70b-versatile")
-        
-        system_prompt = (
-            "Usa el siguiente contexto para responder la pregunta. "
-            "Si no sabes la respuesta, di que no lo sabes. "
-            "\n\n"
-            "{context}"
-        )
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "{input}"),
-        ])
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Question: {input}\n\n Context: {context}"),
+    ])
 
-        question_answer_chain = create_stuff_documents_chain(llm, prompt)
-        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    chain = (
+        {"context": retriever, "input": RunnablePassthrough()}
+        | qa_prompt
+        | llm
+        | StrOutputParser()
+    )
 
-        # 4. Interfaz de Chat
-        user_input = st.text_input("Haz una pregunta sobre el documento:")
-        if user_input:
-            with st.spinner("Pensando..."):
-                response = rag_chain.invoke({"input": user_input})
-                st.markdown("### Respuesta:")
-                st.write(response["answer"])
+    # Chat
+    query = st.text_input("Haz una pregunta sobre el manual:")
+    if query:
+        with st.spinner("Pensando..."):
+            response = chain.invoke(query)
+            st.markdown("### Respuesta:")
+            st.write(response)
 
-    except Exception as e:
-        st.error(f"Ocurrió un error: {e}")
-else:
-    st.warning("Por favor, introduce tu API Key y sube un archivo PDF para comenzar.")
+elif not api_key:
+    st.info("Por favor, introduce tu API Key de Groq en la barra lateral para comenzar.")
