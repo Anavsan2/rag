@@ -1,9 +1,8 @@
 streamlit
 langchain
 langchain-groq
-langchain-huggingface
-langchain-community
-langchain-core
-pymupdf
+langchain_community
+langchain_huggingface
 faiss-cpu
 sentence-transformers
+PyMuPDF
