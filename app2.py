@@ -63,7 +63,7 @@ with st.sidebar:
 # max_entries: Solo guarda los últimos 5 PDFs procesados en memoria para no saturar
 @st.cache_resource(ttl="1h", max_entries=5, show_spinner=False)
 def get_vectorstore_from_file(file_bytes, file_name):
-    """Procesa el PDF y crea la base de datos vectorial."""
+    """Procesa el PDF y crea la base de datos vectorial optimizada."""
     
     # Archivo temporal seguro
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
@@ -74,13 +74,35 @@ def get_vectorstore_from_file(file_bytes, file_name):
         loader = PyMuPDFLoader(tmp_path)
         docs = loader.load()
         
-        # Splitter optimizado
+        # Splitter
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        chunks = text_splitter.split_documents(docs)
+        all_chunks = text_splitter.split_documents(docs)
         
-        # Embeddings (Usamos caché interno de HF para no recargar el modelo)
-        embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-large-en-v1.5")
-        vectorstore = FAISS.from_documents(chunks, embeddings)
+        # --- CAMBIO CLAVE 1: MODELO LIGERO ---
+        # Usamos MiniLM (80MB) en lugar de BGE-Large (1.5GB) para evitar crashes
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        
+        # --- CAMBIO CLAVE 2: PROCESAMIENTO POR LOTES (BATCHING) ---
+        # Procesamos los chunks en grupos de 100 para no saturar la RAM
+        batch_size = 100
+        vectorstore = None
+        
+        # Barra de progreso visual
+        my_bar = st.progress(0, text="Indexando documento...")
+        
+        for i in range(0, len(all_chunks), batch_size):
+            batch = all_chunks[i:i + batch_size]
+            
+            if vectorstore is None:
+                vectorstore = FAISS.from_documents(batch, embeddings)
+            else:
+                vectorstore.add_documents(batch)
+            
+            # Actualizar barra
+            progress = min((i + batch_size) / len(all_chunks), 1.0)
+            my_bar.progress(progress, text=f"Indexando: {int(progress*100)}%")
+            
+        my_bar.empty() # Limpiar barra al terminar
         return vectorstore
         
     finally:
